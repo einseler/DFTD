@@ -88,7 +88,7 @@ fn main() {
                 .set_a2(5.4959)
                 .build();
             let param: RationalDamping3Param = RationalDamping3Param::from((d3param, &mol.num));
-            get_d3_dispersion(&mut mol, &disp, &param, &cutoff, atm, grad)
+            get_d3_dispersion(&mut mol, &disp, &param, &cutoff, atm, grad, 4)
         }
         "gd4" => {
             panic!("D4-dispersion is not yet implemented!")

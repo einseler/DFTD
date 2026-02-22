@@ -1,8 +1,28 @@
 use ndarray::{Array, ArrayView1, Array3};
 use crate::model::{Molecule};
 use nalgebra::{Matrix3xX, Vector3};
+use rayon::prelude::*;
 
 const KCN: f64 = 16.0; // Steepness of counting function
+
+/// Wrapper to allow sending a `*mut f64` across threads.
+/// SAFETY: Callers must ensure non-overlapping writes from different threads.
+#[derive(Clone, Copy)]
+struct SyncMutPtr(*mut f64);
+unsafe impl Send for SyncMutPtr {}
+unsafe impl Sync for SyncMutPtr {}
+
+impl SyncMutPtr {
+    #[inline]
+    unsafe fn write(&self, offset: isize, val: f64) {
+        *self.0.offset(offset) = val;
+    }
+
+    #[inline]
+    unsafe fn add(&self, offset: isize, val: f64) {
+        *self.0.offset(offset) += val;
+    }
+}
 
 pub fn get_coordination_number3(
     mol: &mut Molecule, // Molecular structure data
@@ -37,6 +57,45 @@ pub fn get_coordination_number3(
     }
 }
 
+pub fn get_coordination_number3_par(
+    mol: &mut Molecule,
+    trans: &Matrix3xX<f64>,
+    cutoff: f64,
+    rcov: ArrayView1<f64>,
+) -> () {
+    let n = mol.n_atoms;
+    let cutoff2 = cutoff.powi(2);
+    let mol_ref: &Molecule = &*mol;
+
+    // Full N×N loop: each iat iterates over ALL jat, writing only to its own cn.
+    // This doubles iteration vs triangular but eliminates write conflicts.
+    let cn: Vec<f64> = (0..n).into_par_iter().map(|iat| {
+        let izp = mol_ref.atomlist.identifier[iat];
+        let xyz_i = &mol_ref.atomlist.xyz[iat];
+        let mut cn_iat = 0.0;
+        for jat in 0..n {
+            let jzp = mol_ref.atomlist.identifier[jat];
+            let xyz_j = &mol_ref.atomlist.xyz[jat];
+            for trans_itr in trans.column_iter() {
+                let rij: Vector3<f64> = (xyz_i - xyz_j) - trans_itr;
+                let r2 = rij.norm_squared();
+                if r2 > cutoff2 || r2 < 1.0e-12 {
+                    continue;
+                }
+                let r1 = r2.sqrt();
+                let rc = rcov[izp] + rcov[jzp];
+                cn_iat += exp_count(KCN, r1, rc);
+            }
+        }
+        cn_iat
+    }).collect();
+
+    for (i, cn_val) in cn.into_iter().enumerate() {
+        mol.atomlist.coord_number[i] = cn_val;
+    }
+}
+
+#[allow(dead_code)]
 pub fn get_coordination_number3_grad(
     mol: &mut Molecule, // Molecular structure data
     trans: &Matrix3xX<f64>, // Lattice points
@@ -96,6 +155,85 @@ pub fn get_coordination_number3_grad(
     (dcndr, dcndl)
 }
 
+pub fn get_coordination_number3_grad_par(
+    mol: &mut Molecule,
+    trans: &Matrix3xX<f64>,
+    cutoff: f64,
+    rcov: ArrayView1<f64>,
+) -> (Array3<f64>, Array3<f64>) {
+    let n = mol.n_atoms;
+    let cutoff2 = cutoff.powi(2);
+
+    let mut cn = vec![0.0f64; n];
+    let mut dcndr: Array3<f64> = Array::zeros((n, n, 3));
+    let mut dcndl: Array3<f64> = Array::zeros((n, 3, 3));
+
+    // SAFETY: Each iat writes exclusively to cn[iat], dcndr[iat, *, *], dcndl[iat, *, *].
+    // No two threads share the same first-dimension index.
+    let cn_ptr = SyncMutPtr(cn.as_mut_ptr());
+    let dcndr_ptr = SyncMutPtr(dcndr.as_mut_ptr());
+    let dcndl_ptr = SyncMutPtr(dcndl.as_mut_ptr());
+    let dr_s = [dcndr.strides()[0] as isize, dcndr.strides()[1] as isize, dcndr.strides()[2] as isize];
+    let dl_s = [dcndl.strides()[0] as isize, dcndl.strides()[1] as isize, dcndl.strides()[2] as isize];
+
+    let mol_ref: &Molecule = &*mol;
+
+    // Full N×N loop: each iat iterates over ALL jat, writing only to row iat.
+    // Compared to the triangular loop, this doubles iteration but eliminates
+    // all write conflicts, allowing zero-copy parallelism.
+    (0..n).into_par_iter().for_each(|iat| {
+        let izp = mol_ref.atomlist.identifier[iat];
+        let xyz_i = &mol_ref.atomlist.xyz[iat];
+        let mut cn_iat = 0.0;
+
+        for jat in 0..n {
+            let jzp = mol_ref.atomlist.identifier[jat];
+            let xyz_j = &mol_ref.atomlist.xyz[jat];
+
+            for trans_itr in trans.column_iter() {
+                let rij_vec: Vector3<f64> = (xyz_i - xyz_j) - trans_itr;
+                let r2 = rij_vec.norm_squared();
+
+                if r2 > cutoff2 || r2 < 1.0e-12 {
+                    continue;
+                }
+                let r1 = r2.sqrt();
+
+                let rc = rcov[izp] + rcov[jzp];
+
+                let rij = [rij_vec[0], rij_vec[1], rij_vec[2]];
+                let (countf, countd_scalar) = exp_count_with_deriv(KCN, r1, rc);
+                let countd = [countd_scalar * rij[0] / r1, countd_scalar * rij[1] / r1, countd_scalar * rij[2] / r1];
+
+                cn_iat += countf;
+
+                // Only write to row iat (first dimension) — no conflicts between threads.
+                // The jat writes from the serial version are handled when jat's own
+                // thread processes this pair from the opposite direction.
+                unsafe {
+                    for d in 0..3usize {
+                        dcndr_ptr.add(iat as isize * dr_s[0] + iat as isize * dr_s[1] + d as isize * dr_s[2], countd[d]);
+                        dcndr_ptr.add(iat as isize * dr_s[0] + jat as isize * dr_s[1] + d as isize * dr_s[2], -countd[d]);
+                    }
+                    for a in 0..3usize {
+                        for b in 0..3usize {
+                            dcndl_ptr.add(iat as isize * dl_s[0] + a as isize * dl_s[1] + b as isize * dl_s[2], countd[a] * rij[b]);
+                        }
+                    }
+                }
+            }
+        }
+
+        unsafe { cn_ptr.write(iat as isize, cn_iat); }
+    });
+
+    for (i, cn_val) in cn.into_iter().enumerate() {
+        mol.atomlist.coord_number[i] = cn_val;
+    }
+
+    (dcndr, dcndl)
+}
+
 /// Exponential counting function for coordination number contributions.
 #[inline]
 fn exp_count(
@@ -124,7 +262,8 @@ mod tests {
     use crate::test::get_uracil;
     use crate::cutoff::{RealspaceCutoffBuilder, get_lattice_points_cutoff};
     use crate::dftd3::model3::D3Model;
-    use crate::dftd3::ncoord3::{get_coordination_number3, get_coordination_number3_grad};
+    use crate::dftd3::ncoord3::{get_coordination_number3, get_coordination_number3_grad,
+                                  get_coordination_number3_par, get_coordination_number3_grad_par};
     use ndarray::{array, Array, Array1, Array3};
 
     #[test]
@@ -695,5 +834,47 @@ mod tests {
         assert!(cn.abs_diff_eq(&cn_ref, 1e-14));
         assert!(dcndr.abs_diff_eq(&dcndr_ref, 1e-14));
         assert!(dcndl.abs_diff_eq(&dcndl_ref, 1e-14));
+    }
+
+    #[test]
+    fn coordination_number3_cn_par() -> () {
+        // Run serial version
+        let mut mol_serial = get_uracil();
+        let cutoff = RealspaceCutoffBuilder::new().build();
+        let lattr = get_lattice_points_cutoff(&mol_serial.periodic, &mol_serial.lattice, cutoff.cn);
+        let disp = D3Model::from_molecule(&mol_serial, None);
+        get_coordination_number3(&mut mol_serial, &lattr, cutoff.cn, disp.rcov.view());
+        let cn_serial: Array1<f64> = Array::from(mol_serial.atomlist.coord_number);
+
+        // Run parallel version
+        let mut mol_par = get_uracil();
+        let lattr = get_lattice_points_cutoff(&mol_par.periodic, &mol_par.lattice, cutoff.cn);
+        let disp = D3Model::from_molecule(&mol_par, None);
+        get_coordination_number3_par(&mut mol_par, &lattr, cutoff.cn, disp.rcov.view());
+        let cn_par: Array1<f64> = Array::from(mol_par.atomlist.coord_number);
+
+        assert!(cn_par.abs_diff_eq(&cn_serial, 1e-14));
+    }
+
+    #[test]
+    fn coordination_number3_derivative_par() -> () {
+        // Run serial version
+        let mut mol_serial = get_uracil();
+        let cutoff = RealspaceCutoffBuilder::new().build();
+        let lattr = get_lattice_points_cutoff(&mol_serial.periodic, &mol_serial.lattice, cutoff.cn);
+        let disp = D3Model::from_molecule(&mol_serial, None);
+        let (dcndr_serial, dcndl_serial) = get_coordination_number3_grad(&mut mol_serial, &lattr, cutoff.cn, disp.rcov.view());
+        let cn_serial: Array1<f64> = Array::from(mol_serial.atomlist.coord_number);
+
+        // Run parallel version
+        let mut mol_par = get_uracil();
+        let lattr = get_lattice_points_cutoff(&mol_par.periodic, &mol_par.lattice, cutoff.cn);
+        let disp = D3Model::from_molecule(&mol_par, None);
+        let (dcndr_par, dcndl_par) = get_coordination_number3_grad_par(&mut mol_par, &lattr, cutoff.cn, disp.rcov.view());
+        let cn_par: Array1<f64> = Array::from(mol_par.atomlist.coord_number);
+
+        assert!(cn_par.abs_diff_eq(&cn_serial, 1e-14));
+        assert!(dcndr_par.abs_diff_eq(&dcndr_serial, 1e-14));
+        assert!(dcndl_par.abs_diff_eq(&dcndl_serial, 1e-14));
     }
 }

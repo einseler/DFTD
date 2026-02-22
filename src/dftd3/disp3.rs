@@ -3,9 +3,10 @@ use crate::model::Molecule;
 use crate::dftd3::model3::D3Model;
 use crate::dftd3::damping3::RationalDamping3Param;
 use crate::cutoff::{RealspaceCutoff, get_lattice_points_cutoff};
-use crate::dftd3::ncoord3::{get_coordination_number3, get_coordination_number3_grad};
+use crate::dftd3::ncoord3::{get_coordination_number3_par, get_coordination_number3_grad_par};
 use nalgebra::Matrix3xX;
 use crate::disp::DispersionResult;
+use std::time::Instant;
 
 /// Wrapper to handle the evaluation of dispersion energy and derivatives.
 pub fn get_dispersion(
@@ -15,19 +16,41 @@ pub fn get_dispersion(
     cutoff: &RealspaceCutoff,
     atm: bool,
     grad: bool,
+    num_threads: usize,
+) -> DispersionResult {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build().unwrap();
+    eprintln!("[DFT-D3] rayon threads: {}, n_atoms: {}", pool.current_num_threads(), mol.n_atoms);
+
+    pool.install(|| get_dispersion_inner(mol, disp, param, cutoff, atm, grad))
+}
+
+fn get_dispersion_inner(
+    mol: &mut Molecule,
+    disp: &D3Model,
+    param: &RationalDamping3Param,
+    cutoff: &RealspaceCutoff,
+    atm: bool,
+    grad: bool,
 ) -> DispersionResult {
     if grad {
+        let t0 = Instant::now();
+
         // Obtain the lattice with the cutoff radius for calculating coordination numbers
         // and calculate coordination numbers as well as their derivatives w.r.t. the Cartesian coordinates
         // and strain deformations. The CNs are saved in atoms and the derivatives in arrays.
         let lattr: Matrix3xX<f64> = get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.cn);
-        let (dcndr, dcndl): (Array3<f64>, Array3<f64>) = get_coordination_number3_grad(mol, &lattr, cutoff.cn, disp.rcov.view());
+        let (dcndr, dcndl): (Array3<f64>, Array3<f64>) = get_coordination_number3_grad_par(mol, &lattr, cutoff.cn, disp.rcov.view());
+        let t_cn = t0.elapsed();
 
         // Calculate weight references and their derivatives w.r.t. CN. These are saved them in atoms.
+        let t1 = Instant::now();
         disp.weight_references_grad(mol);
+        let t_wr = t1.elapsed();
 
         // Calculate C6 parameters and their derivatives w.r.t. CN.
-        let (c6, dc6dcn): (Array2<f64>, Array2<f64>) = disp.get_atomic_c6_grad(&mol);
+        let t1 = Instant::now();
+        let (c6, dc6dcn): (Array2<f64>, Array2<f64>) = disp.get_atomic_c6_grad_par(&mol);
+        let t_c6 = t1.elapsed();
 
         // Initialise the energy vector, its derivative w.r.t. CN, the gradient
         // and sigma matrix as a zero-matrices.
@@ -38,10 +61,13 @@ pub fn get_dispersion(
 
         // Obtain the lattice with the cutoff radius for calculating 2-body dispersion
         // and evaluate 2-body dispersion.
+        let t1 = Instant::now();
         let lattr: Matrix3xX<f64> = get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.disp2);
         param.get_dispersion2_grad_par(mol, &lattr, cutoff.disp2, c6.view(), dc6dcn.view(),
                                    energies.view_mut(), dedcn.view_mut(), gradient.view_mut(), sigma.view_mut());
+        let t_disp2 = t1.elapsed();
 
+        let t1 = Instant::now();
         if atm {
             // Obtain the lattice with the cutoff radius for calculating 3-body dispersion
             // and evaluate Axilrod-Teller-Muto (ATM) 3-body dispersion.
@@ -49,16 +75,23 @@ pub fn get_dispersion(
             param.get_dispersion3_grad(mol, &lattr, cutoff.disp2, c6.view(), dc6dcn.view(),
                                        energies.view_mut(), dedcn.view_mut(), gradient.view_mut(), sigma.view_mut());
         }
+        let t_disp3 = t1.elapsed();
 
         // The gradient: dE/dr = (∂E/∂(CN)) (d(CN)/dr) + ∂E/∂r.
         // So far, only ∂E/∂r is calculated. The first term has to be added to it.
         // call d3_gemv(dcndr, dEdcn, gradient, beta=1.0_wp)
+        let t1 = Instant::now();
         gradient += &(dedcn.dot(&dcndr.into_shape((mol.n_atoms, mol.n_atoms*3)).unwrap()).into_shape((mol.n_atoms, 3)).unwrap());
 
         // The sigma matrix: dE/dL = (∂E/∂(CN)) (d(CN)/dL) + ∂E/∂L.
         // So far, only ∂E/∂L is calculated. The first term has to be added to it.
         // call d3_gemv(dcndL, dEdcn, sigma, beta=1.0_wp)
         sigma += &(dedcn.dot(&dcndl.into_shape((mol.n_atoms, 3*3)).unwrap()).into_shape((3, 3)).unwrap());
+        let t_gemv = t1.elapsed();
+
+        let t_total = t0.elapsed();
+        eprintln!("[DFT-D3 grad] coord_number: {:?}, weight_ref: {:?}, c6: {:?}, disp2: {:?}, disp3: {:?}, gemv: {:?}, total: {:?}",
+                  t_cn, t_wr, t_c6, t_disp2, t_disp3, t_gemv, t_total);
 
         DispersionResult{
             energy: energies.sum(),
@@ -66,31 +99,46 @@ pub fn get_dispersion(
             sigma: Some(sigma),
         }
     } else {
+        let t0 = Instant::now();
+
         // Obtain the lattice with the cutoff radius for calculating coordination numbers
         // and calculate coordination numbers. These are saved in atoms.
         let lattr: Matrix3xX<f64> = get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.cn);
-        get_coordination_number3(mol, &lattr, cutoff.cn, disp.rcov.view());
+        get_coordination_number3_par(mol, &lattr, cutoff.cn, disp.rcov.view());
+        let t_cn = t0.elapsed();
 
         // Calculate weight references and save them in atoms.
+        let t1 = Instant::now();
         disp.weight_references(mol);
+        let t_wr = t1.elapsed();
 
         // Calculate C6 parameters.
-        let c6: Array2<f64> = disp.get_atomic_c6(&mol);
+        let t1 = Instant::now();
+        let c6: Array2<f64> = disp.get_atomic_c6_par(&mol);
+        let t_c6 = t1.elapsed();
 
         // Initialise the energy vector as a zero-vector.
         let mut energies: Array1<f64> = Array::zeros(mol.n_atoms);
 
         // Obtain the lattice with the cutoff radius for calculating 2-body dispersion
         // and evaluate 2-body dispersion.
+        let t1 = Instant::now();
         let lattr: Matrix3xX<f64> = get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.disp2);
         param.get_dispersion2_par(mol, &lattr, cutoff.disp2, c6.view(), energies.view_mut());
+        let t_disp2 = t1.elapsed();
 
+        let t1 = Instant::now();
         if atm {
             // Obtain the lattice with the cutoff radius for calculating 3-body dispersion
             // and evaluate Axilrod-Teller-Muto (ATM) 3-body dispersion.
             let lattr: Matrix3xX<f64> = get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.disp3);
             param.get_dispersion3(mol, &lattr, cutoff.disp3, c6.view(), energies.view_mut());
         }
+        let t_disp3 = t1.elapsed();
+
+        let t_total = t0.elapsed();
+        eprintln!("[DFT-D3] coord_number: {:?}, weight_ref: {:?}, c6: {:?}, disp2: {:?}, disp3: {:?}, total: {:?}",
+                  t_cn, t_wr, t_c6, t_disp2, t_disp3, t_total);
 
         DispersionResult{
             energy: energies.sum(),
@@ -129,7 +177,7 @@ mod tests {
         let param: RationalDamping3Param = RationalDamping3Param::from((d3param, &mol.num));
         let cutoff: RealspaceCutoff = RealspaceCutoffBuilder::new().build();
 
-        let disp_result = get_dispersion(&mut mol, &disp, &param, &cutoff, true, false);
+        let disp_result = get_dispersion(&mut mol, &disp, &param, &cutoff, true, false, 1);
         let energy = disp_result.energy;
 
         let energy_ref =  -0.0273470728456744;
@@ -155,7 +203,7 @@ mod tests {
         let param: RationalDamping3Param = RationalDamping3Param::from((d3param, &mol.num));
         let cutoff: RealspaceCutoff = RealspaceCutoffBuilder::new().build();
 
-        let disp_result = get_dispersion(&mut mol, &disp, &param, &cutoff, true, true);
+        let disp_result = get_dispersion(&mut mol, &disp, &param, &cutoff, true, true, 1);
         let energy = disp_result.energy;
         let gradient = disp_result.gradient.unwrap();
         let sigma = disp_result.sigma.unwrap();

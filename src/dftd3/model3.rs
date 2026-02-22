@@ -6,8 +6,22 @@ use crate::defaults::WF_DEFAULT;
 
 use ndarray::{s, Array, Array1, Array2, Array4, Axis};
 use soa_derive::soa_zip;
+use rayon::prelude::*;
 
+/// Wrapper to allow sending a `*mut f64` across threads.
+/// SAFETY: Callers must ensure non-overlapping writes from different threads.
+#[derive(Clone, Copy)]
+struct SyncMutPtr(*mut f64);
+unsafe impl Send for SyncMutPtr {}
+unsafe impl Sync for SyncMutPtr {}
 
+impl SyncMutPtr {
+    #[inline]
+    unsafe fn write(&self, offset: isize, val: f64) {
+        *self.0.offset(offset) = val;
+    }
+
+}
 
 #[derive(Clone)]
 pub struct D3Model {
@@ -228,6 +242,86 @@ impl D3Model {
                 dc6dcn[[iat, jat]] = dc6dcnj;
             }
         }
+
+        (c6, dc6dcn)
+    }
+
+    pub fn get_atomic_c6_par(
+        &self,
+        mol: &Molecule,
+    ) -> Array2<f64> {
+        let n = mol.n_atoms;
+        let mut c6 = Array2::<f64>::zeros((n, n));
+
+        // SAFETY: Each (iat, jat) pair is processed by exactly one iat iteration.
+        // Cell c6[[j,i]] (j<=i) is only written when iat=i, so no two threads
+        // touch the same cell.
+        let c6_ptr = SyncMutPtr(c6.as_mut_ptr());
+        let s0 = c6.strides()[0] as isize;
+        let s1 = c6.strides()[1] as isize;
+
+        (0..n).into_par_iter().for_each(move |iat| {
+            let izp = mol.atomlist.identifier[iat];
+            let gwvec_i = &mol.atomlist.gaussian_weight[iat];
+            for jat in 0..=iat {
+                let jzp = mol.atomlist.identifier[jat];
+                let gwvec_j = &mol.atomlist.gaussian_weight[jat];
+                let mut dc6 = 0.0;
+                for (c6_vec, gwvec_ii) in self.c6.slice(s![jzp, izp, ..self.ref_[jzp], ..self.ref_[izp]]).axis_iter(Axis(1)).zip(gwvec_i.iter()) {
+                    for (c6_val, gwvec_jj) in c6_vec.iter().zip(gwvec_j.iter()) {
+                        dc6 += gwvec_ii * gwvec_jj * c6_val;
+                    }
+                }
+                unsafe {
+                    c6_ptr.write(jat as isize * s0 + iat as isize * s1, dc6);
+                    c6_ptr.write(iat as isize * s0 + jat as isize * s1, dc6);
+                }
+            }
+        });
+
+        c6
+    }
+
+    pub fn get_atomic_c6_grad_par(
+        &self,
+        mol: &Molecule,
+    ) -> (Array2<f64>, Array2<f64>) {
+        let n = mol.n_atoms;
+        let mut c6 = Array2::<f64>::zeros((n, n));
+        let mut dc6dcn = Array2::<f64>::zeros((n, n));
+
+        // SAFETY: Same non-overlapping argument as get_atomic_c6_par.
+        let c6_ptr = SyncMutPtr(c6.as_mut_ptr());
+        let dc6_ptr = SyncMutPtr(dc6dcn.as_mut_ptr());
+        let s0 = c6.strides()[0] as isize;
+        let s1 = c6.strides()[1] as isize;
+
+        (0..n).into_par_iter().for_each(move |iat| {
+            let izp = mol.atomlist.identifier[iat];
+            let gwvec_i = &mol.atomlist.gaussian_weight[iat];
+            let gwdcn_i = &mol.atomlist.gaussian_weight_dcn[iat];
+            for jat in 0..=iat {
+                let jzp = mol.atomlist.identifier[jat];
+                let gwvec_j = &mol.atomlist.gaussian_weight[jat];
+                let gwdcn_j = &mol.atomlist.gaussian_weight_dcn[jat];
+                let mut dc6_val = 0.0;
+                let mut dc6dcni = 0.0;
+                let mut dc6dcnj = 0.0;
+                for (c6_vec, (gwvec_ii, gwdcn_ii)) in self.c6.slice(s![jzp, izp, ..self.ref_[jzp], ..self.ref_[izp]]).axis_iter(Axis(1)).zip(gwvec_i.iter().zip(gwdcn_i.iter())) {
+                    for (c6_val_ref, (gwvec_jj, gwdcn_jj)) in c6_vec.iter().zip(gwvec_j.iter().zip(gwdcn_j.iter())) {
+                        dc6_val += gwvec_ii * gwvec_jj * c6_val_ref;
+                        dc6dcni += gwdcn_ii * gwvec_jj * c6_val_ref;
+                        dc6dcnj += gwvec_ii * gwdcn_jj * c6_val_ref;
+                    }
+                }
+                unsafe {
+                    c6_ptr.write(jat as isize * s0 + iat as isize * s1, dc6_val);
+                    c6_ptr.write(iat as isize * s0 + jat as isize * s1, dc6_val);
+                    dc6_ptr.write(jat as isize * s0 + iat as isize * s1, dc6dcni);
+                    dc6_ptr.write(iat as isize * s0 + jat as isize * s1, dc6dcnj);
+                }
+            }
+        });
 
         (c6, dc6dcn)
     }
@@ -1121,5 +1215,32 @@ mod tests {
 
         assert!(c6.abs_diff_eq(&c6_ref, 1e-13));
         assert!(dc6dcn.abs_diff_eq(&dc6dcn_ref, 1e-13));
+    }
+
+    #[test]
+    fn atomic_c6_par() -> () {
+        let mut mol = get_uracil();
+        let disp: D3Model = D3Model::from_molecule(&mol, None);
+        set_uracil_properties3(&mut mol);
+        disp.weight_references_grad(&mut mol);
+
+        let c6_serial: Array2<f64> = disp.get_atomic_c6(&mol);
+        let c6_par: Array2<f64> = disp.get_atomic_c6_par(&mol);
+
+        assert!(c6_par.abs_diff_eq(&c6_serial, 1e-15));
+    }
+
+    #[test]
+    fn atomic_c6_derivative_par() -> () {
+        let mut mol = get_uracil();
+        let disp: D3Model = D3Model::from_molecule(&mol, None);
+        set_uracil_properties3(&mut mol);
+        disp.weight_references_grad(&mut mol);
+
+        let (c6_serial, dc6dcn_serial): (Array2<f64>, Array2<f64>) = disp.get_atomic_c6_grad(&mol);
+        let (c6_par, dc6dcn_par): (Array2<f64>, Array2<f64>) = disp.get_atomic_c6_grad_par(&mol);
+
+        assert!(c6_par.abs_diff_eq(&c6_serial, 1e-15));
+        assert!(dc6dcn_par.abs_diff_eq(&dc6dcn_serial, 1e-15));
     }
 }
