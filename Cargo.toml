@@ -24,6 +24,7 @@ clap = "=3.0.0-beta.2"
 chemfiles = "0.10"
 nalgebra = "0.32.1"
 soa_derive = "0.10.0"
+rayon = "1.7"
 
 # [profile.release]
 # debug = true

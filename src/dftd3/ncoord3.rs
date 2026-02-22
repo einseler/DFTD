@@ -1,8 +1,6 @@
-use ndarray::{s, Array, Array1, ArrayView1, Array3};
+use ndarray::{Array, ArrayView1, Array3};
 use crate::model::{Molecule};
 use nalgebra::{Matrix3xX, Vector3};
-use std::ops::{AddAssign, SubAssign};
-use crate::auxliary_functions::spread;
 
 const KCN: f64 = 16.0; // Steepness of counting function
 
@@ -53,8 +51,8 @@ pub fn get_coordination_number3_grad(
     for (iat, (izp, xyz_i)) in mol.atomlist.identifier.iter().zip(mol.atomlist.xyz.iter()).enumerate() {
         for (jat, (jzp, xyz_j)) in mol.atomlist.identifier[..=iat].iter().zip(mol.atomlist.xyz[..=iat].iter()).enumerate() {
             for trans_itr in trans.column_iter() {
-                let rij: Vector3<f64> = (xyz_i - xyz_j) - trans_itr;
-                let r2 = rij.norm_squared();
+                let rij_vec: Vector3<f64> = (xyz_i - xyz_j) - trans_itr;
+                let r2 = rij_vec.norm_squared();
 
                 if r2 > cutoff2 || r2 < 1.0e-12 {
                     continue;
@@ -63,25 +61,33 @@ pub fn get_coordination_number3_grad(
 
                 let rc = rcov[*izp] + rcov[*jzp];
 
-                let rij: Array1<f64> = Array::from_iter(rij.iter().map(|x| *x));
-                let countf =  exp_count(KCN, r1, rc);
-                let countd: Array1<f64> = dexp_count(KCN, r1, rc) * (&rij/r1);
+                let rij = [rij_vec[0], rij_vec[1], rij_vec[2]];
+                let (countf, countd_scalar) = exp_count_with_deriv(KCN, r1, rc);
+                let countd = [countd_scalar * rij[0] / r1, countd_scalar * rij[1] / r1, countd_scalar * rij[2] / r1];
 
                 mol.atomlist.coord_number[iat] += countf;
                 if iat != jat {
                     mol.atomlist.coord_number[jat] += countf
                 }
 
-                dcndr.slice_mut(s![iat, iat, ..]).add_assign(&countd);
-                dcndr.slice_mut(s![jat, jat, ..]).sub_assign(&countd);
-                dcndr.slice_mut(s![jat, iat, ..]).add_assign(&countd);
-                dcndr.slice_mut(s![iat, jat, ..]).sub_assign(&countd);
+                for d in 0..3 {
+                    dcndr[[iat, iat, d]] += countd[d];
+                    dcndr[[jat, jat, d]] -= countd[d];
+                    dcndr[[jat, iat, d]] += countd[d];
+                    dcndr[[iat, jat, d]] -= countd[d];
+                }
 
-                let sigma = &spread(&countd, 1, 3) * &spread(&rij, 0, 3);
-
-                dcndl.slice_mut(s![iat, .., ..]).add_assign(&sigma);
+                for a in 0..3 {
+                    for b in 0..3 {
+                        dcndl[[iat, a, b]] += countd[a] * rij[b];
+                    }
+                }
                 if iat != jat {
-                    dcndl.slice_mut(s![jat, .., ..]).add_assign(&sigma);
+                    for a in 0..3 {
+                        for b in 0..3 {
+                            dcndl[[jat, a, b]] += countd[a] * rij[b];
+                        }
+                    }
                 }
             }
         }
@@ -91,6 +97,7 @@ pub fn get_coordination_number3_grad(
 }
 
 /// Exponential counting function for coordination number contributions.
+#[inline]
 fn exp_count(
     k: f64, // Steepness of the counting function.
     r: f64, // Current distance.
@@ -100,15 +107,16 @@ fn exp_count(
     1.0/(1.0 + (-k*(r0/r - 1.0)).exp())
 }
 
-/// Derivative of the counting function w.r.t. the distance.
-fn dexp_count(
+/// Combined counting function and its derivative w.r.t. the distance.
+#[inline]
+fn exp_count_with_deriv(
     k: f64, // Steepness of the counting function.
     r: f64, // Current distance.
     r0: f64, // Cutoff radius.
-) -> f64 {
+) -> (f64, f64) {
     let expterm = (-k*(r0/r - 1.0)).exp();
-
-    (-k*r0*expterm)/(r.powi(2)*((expterm + 1.0).powi(2)))
+    let denom = expterm + 1.0;
+    (1.0 / denom, (-k*r0*expterm) / (r*r*denom*denom))
 }
 
 #[cfg(test)]

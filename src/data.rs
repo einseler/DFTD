@@ -2316,17 +2316,15 @@ pub fn get_vdw_rad(atomic_number: u8) -> f64 {
 pub fn get_vdw_rad_pair(atomic_number1: u8, atomic_number2: u8) -> f64 {
     if atomic_number1 > 0 && atomic_number1 <= (VDW_MAX_ELEM as u8)
     && atomic_number2 > 0 && atomic_number2 <= (VDW_MAX_ELEM as u8) {
-        let atomic_number1 = atomic_number1 as usize;
-        let atomic_number2 = atomic_number2 as usize;
-
-        let index = if atomic_number1 > atomic_number2 {
-            (atomic_number2 + atomic_number1 * (atomic_number1 - 1) / 2) - 1
+        if atomic_number1 > atomic_number2 {
+            VDWRAD[((atomic_number2 + atomic_number1 * (atomic_number1 - 1)/2) - 1) as usize]
         } else {
-            (atomic_number1 + atomic_number2 * (atomic_number2 - 1) / 2) - 1
-        };
-        VDWRAD[index]
+            VDWRAD[((atomic_number1 + atomic_number2 * (atomic_number2 - 1)/2) - 1) as usize]
+        }
     } else {
         0.0
     }
 }
+
+
 

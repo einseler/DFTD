@@ -94,19 +94,20 @@ impl D3Model {
         // parallelise this loop
         for (izp, coord_number, gaussian_weight) in soa_zip!(&mut mol.atomlist, [identifier, coord_number, mut gaussian_weight]) {
             *gaussian_weight = Array::zeros(MREF);
+            let nref = self.ref_[*izp];
+            let mut gw_cache = [0.0f64; MREF];
             let mut norm = 0.0;
 
-            for cn_refi in self.cn.slice(s![.., ..self.ref_[*izp]]).axis_iter(Axis(1)) {
-                let gw = weight_cn(self.wf, *coord_number, cn_refi[*izp]);
-                norm += gw;
+            for (iref, cn_refi) in self.cn.slice(s![.., ..nref]).axis_iter(Axis(1)).enumerate() {
+                gw_cache[iref] = weight_cn(self.wf, *coord_number, cn_refi[*izp]);
+                norm += gw_cache[iref];
             }
             norm = 1.0 / norm;
 
-            for(cn_refi, at_gw) in self.cn.slice(s![.., ..self.ref_[*izp]]).axis_iter(Axis(1)).zip(gaussian_weight.iter_mut()) {
-                let expw = weight_cn(self.wf, *coord_number, cn_refi[*izp]);
-                let mut gwk = expw * norm;
+            for (iref, (cn_refi, at_gw)) in self.cn.slice(s![.., ..nref]).axis_iter(Axis(1)).zip(gaussian_weight.iter_mut()).enumerate() {
+                let mut gwk = gw_cache[iref] * norm;
                 if !gwk.is_finite() {
-                    if ((self.cn.slice(s![*izp, ..self.ref_[*izp]]))
+                    if ((self.cn.slice(s![*izp, ..nref]))
                         .iter()
                         .cloned()
                         .max_by(|a, b| a.partial_cmp(b).expect("Tried to compare a NaN"))
@@ -134,21 +135,23 @@ impl D3Model {
         for (izp, coord_number, gaussian_weight, gaussian_weight_dcn) in soa_zip!(&mut mol.atomlist, [identifier, coord_number, mut gaussian_weight, mut gaussian_weight_dcn]) {
             *gaussian_weight = Array::zeros(MREF);
             *gaussian_weight_dcn = Array::zeros(MREF);
+            let nref = self.ref_[*izp];
+            let mut gw_cache = [0.0f64; MREF];
             let mut norm = 0.0;
             let mut dnorm = 0.0;
-            for cn_refi in self.cn.slice(s![.., ..self.ref_[*izp]]).axis_iter(Axis(1)) {
-                let gw = weight_cn(self.wf, *coord_number, cn_refi[*izp]);
-                norm += gw;
-                dnorm += 2.0 * self.wf * (cn_refi[*izp] - *coord_number) * gw;
+            for (iref, cn_refi) in self.cn.slice(s![.., ..nref]).axis_iter(Axis(1)).enumerate() {
+                gw_cache[iref] = weight_cn(self.wf, *coord_number, cn_refi[*izp]);
+                norm += gw_cache[iref];
+                dnorm += 2.0 * self.wf * (cn_refi[*izp] - *coord_number) * gw_cache[iref];
             }
             norm = 1.0 / norm;
 
-            for (cn_refi, (at_gw, at_gwdcn)) in self.cn.slice(s![.., ..self.ref_[*izp]]).axis_iter(Axis(1)).zip(gaussian_weight.iter_mut().zip(gaussian_weight_dcn.iter_mut())) {
-                let expw = weight_cn(self.wf, *coord_number, cn_refi[*izp]);
+            for (iref, (cn_refi, (at_gw, at_gwdcn))) in self.cn.slice(s![.., ..nref]).axis_iter(Axis(1)).zip(gaussian_weight.iter_mut().zip(gaussian_weight_dcn.iter_mut())).enumerate() {
+                let expw = gw_cache[iref];
                 let expd = 2.0 * self.wf * (cn_refi[*izp] - *coord_number) * expw;
                 let mut gwk = expw * norm;
                 if !gwk.is_finite() {
-                    if ((self.cn.slice(s![*izp, ..self.ref_[*izp]]))
+                    if ((self.cn.slice(s![*izp, ..nref]))
                         .iter()
                         .cloned()
                         .max_by(|a, b| a.partial_cmp(b).expect("Tried to compare a NaN"))
@@ -216,8 +219,6 @@ impl D3Model {
                         dc6 += gwvec_ii * gwvec_jj * c6_val;
                         dc6dcni += gwdcn_ii * gwvec_jj * c6_val;
                         dc6dcnj += gwvec_ii * gwdcn_jj * c6_val;
-                        dc6dcn[[jat, iat]] = dc6dcni;
-                        dc6dcn[[iat, jat]] = dc6dcnj;
                     }
                 }
 
@@ -232,6 +233,7 @@ impl D3Model {
     }
 }
 
+#[inline]
 fn weight_cn(wf: f64, cn: f64, cnref: f64) -> f64 {
     // cngw
     (-wf * (cn - cnref).powi(2)).exp()

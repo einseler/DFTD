@@ -39,7 +39,7 @@ pub fn get_dispersion(
         // Obtain the lattice with the cutoff radius for calculating 2-body dispersion
         // and evaluate 2-body dispersion.
         let lattr: Matrix3xX<f64> = get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.disp2);
-        param.get_dispersion2_grad(mol, &lattr, cutoff.disp2, c6.view(), dc6dcn.view(),
+        param.get_dispersion2_grad_par(mol, &lattr, cutoff.disp2, c6.view(), dc6dcn.view(),
                                    energies.view_mut(), dedcn.view_mut(), gradient.view_mut(), sigma.view_mut());
 
         if atm {
@@ -83,7 +83,7 @@ pub fn get_dispersion(
         // Obtain the lattice with the cutoff radius for calculating 2-body dispersion
         // and evaluate 2-body dispersion.
         let lattr: Matrix3xX<f64> = get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.disp2);
-        param.get_dispersion2(mol, &lattr, cutoff.disp2, c6.view(), energies.view_mut());
+        param.get_dispersion2_par(mol, &lattr, cutoff.disp2, c6.view(), energies.view_mut());
 
         if atm {
             // Obtain the lattice with the cutoff radius for calculating 3-body dispersion

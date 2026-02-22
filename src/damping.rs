@@ -19,6 +19,7 @@
 // }
 
 /// Logic exercise to distribute a triple energy to atomwise energies.
+#[inline]
 pub fn triple_scale(ii: usize, jj: usize, kk: usize) -> f64 {
     // atom indices: ii, jj, kk
     let equals: u8 = ((ii == jj) as u8) + ((ii == kk) as u8) + ((jj == kk) as u8);
