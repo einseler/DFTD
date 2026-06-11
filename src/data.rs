@@ -2316,10 +2316,14 @@ pub fn get_vdw_rad(atomic_number: u8) -> f64 {
 pub fn get_vdw_rad_pair(atomic_number1: u8, atomic_number2: u8) -> f64 {
     if atomic_number1 > 0 && atomic_number1 <= (VDW_MAX_ELEM as u8)
     && atomic_number2 > 0 && atomic_number2 <= (VDW_MAX_ELEM as u8) {
-        if atomic_number1 > atomic_number2 {
-            VDWRAD[((atomic_number2 + atomic_number1 * (atomic_number1 - 1)/2) - 1) as usize]
+        // Index arithmetic in usize: `z * (z - 1)` overflows u8 for Z >= 17
+        // (e.g. Cl: 17*16 = 272 > 255), which silently wraps in release and
+        // panics in debug. Widen first.
+        let (z1, z2) = (atomic_number1 as usize, atomic_number2 as usize);
+        if z1 > z2 {
+            VDWRAD[(z2 + z1 * (z1 - 1) / 2) - 1]
         } else {
-            VDWRAD[((atomic_number1 + atomic_number2 * (atomic_number2 - 1)/2) - 1) as usize]
+            VDWRAD[(z1 + z2 * (z2 - 1) / 2) - 1]
         }
     } else {
         0.0

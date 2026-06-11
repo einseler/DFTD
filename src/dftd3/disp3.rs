@@ -1,7 +1,7 @@
 use ndarray::{Array, Array1, Array2, Array3};
 use crate::model::Molecule;
 use crate::dftd3::model3::D3Model;
-use crate::dftd3::damping3::RationalDamping3Param;
+use crate::dftd3::damping3::{RationalDamping3Param, ZeroDamping3Param};
 use crate::cutoff::{RealspaceCutoff, get_lattice_points_cutoff};
 use crate::dftd3::ncoord3::{get_coordination_number3_par, get_coordination_number3_grad_par};
 use nalgebra::Matrix3xX;
@@ -112,6 +112,127 @@ fn get_dispersion_inner(
     }
 }
 
+/// **Public entry point for D3-Zero damping** (Grimme 2010 original).
+///
+/// Mirrors [`get_dispersion`] but takes a [`ZeroDamping3Param`] and uses
+/// the soft `1 / (1 + 6·(R0/R)^α)` damping function rather than BJ's
+/// `1 / (R^n + (a1·√(3 r4r2_i r4r2_j) + a2)^n)`. Used by methods that
+/// were parameterised against the original D3 damping such as
+/// PM6-D3H4, PM7-D3, AM1-D3, and HF-D3.
+///
+/// Same calling convention as [`get_dispersion`]: build the model and
+/// the param, hand them in, choose whether to include the 3-body ATM
+/// term and whether to also compute the gradient.
+pub fn get_dispersion_zero(
+    mol: &mut Molecule,
+    disp: &D3Model,
+    param: &ZeroDamping3Param,
+    cutoff: &RealspaceCutoff,
+    atm: bool,
+    grad: bool,
+    num_threads: usize,
+) -> DispersionResult {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .unwrap();
+    pool.install(|| get_dispersion_zero_inner(mol, disp, param, cutoff, atm, grad))
+}
+
+fn get_dispersion_zero_inner(
+    mol: &mut Molecule,
+    disp: &D3Model,
+    param: &ZeroDamping3Param,
+    cutoff: &RealspaceCutoff,
+    atm: bool,
+    grad: bool,
+) -> DispersionResult {
+    if grad {
+        let lattr: Matrix3xX<f64> =
+            get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.cn);
+        let (dcndr, dcndl): (Array3<f64>, Array3<f64>) = get_coordination_number3_grad_par(
+            mol, &lattr, cutoff.cn, disp.rcov.view(),
+        );
+
+        disp.weight_references_grad(mol);
+        let (c6, dc6dcn): (Array2<f64>, Array2<f64>) = disp.get_atomic_c6_grad_par(&mol);
+
+        let mut energies: Array1<f64> = Array::zeros(mol.n_atoms);
+        let mut dedcn: Array1<f64> = Array::zeros(mol.n_atoms);
+        let mut gradient: Array2<f64> = Array::zeros((mol.n_atoms, 3));
+        let mut sigma: Array2<f64> = Array::zeros((3, 3));
+
+        let lattr: Matrix3xX<f64> =
+            get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.disp2);
+        param.get_dispersion2_grad_par(
+            mol,
+            &lattr,
+            cutoff.disp2,
+            c6.view(),
+            dc6dcn.view(),
+            energies.view_mut(),
+            dedcn.view_mut(),
+            gradient.view_mut(),
+            sigma.view_mut(),
+        );
+
+        if atm {
+            let lattr: Matrix3xX<f64> =
+                get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.disp3);
+            param.get_dispersion3_grad(
+                mol,
+                &lattr,
+                cutoff.disp2,
+                c6.view(),
+                dc6dcn.view(),
+                energies.view_mut(),
+                dedcn.view_mut(),
+                gradient.view_mut(),
+                sigma.view_mut(),
+            );
+        }
+
+        gradient += &(dedcn
+            .dot(&dcndr.into_shape((mol.n_atoms, mol.n_atoms * 3)).unwrap())
+            .into_shape((mol.n_atoms, 3))
+            .unwrap());
+        sigma += &(dedcn
+            .dot(&dcndl.into_shape((mol.n_atoms, 3 * 3)).unwrap())
+            .into_shape((3, 3))
+            .unwrap());
+
+        DispersionResult {
+            energy: energies.sum(),
+            gradient: Some(gradient),
+            sigma: Some(sigma),
+        }
+    } else {
+        let lattr: Matrix3xX<f64> =
+            get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.cn);
+        get_coordination_number3_par(mol, &lattr, cutoff.cn, disp.rcov.view());
+        disp.weight_references(mol);
+        let c6: Array2<f64> = disp.get_atomic_c6_par(&mol);
+
+        let mut energies: Array1<f64> = Array::zeros(mol.n_atoms);
+
+        let lattr: Matrix3xX<f64> =
+            get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.disp2);
+        param.get_dispersion2_par(mol, &lattr, cutoff.disp2, c6.view(), energies.view_mut());
+
+        if atm {
+            let lattr: Matrix3xX<f64> =
+                get_lattice_points_cutoff(&mol.periodic, &mol.lattice, cutoff.disp3);
+            param.get_dispersion3(mol, &lattr, cutoff.disp3, c6.view(), energies.view_mut());
+        }
+
+        DispersionResult {
+            energy: energies.sum(),
+            gradient: None,
+            sigma: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::test::get_uracil;
@@ -211,5 +332,112 @@ mod tests {
         assert!(energy.abs_diff_eq(&energy_ref, 1e-15));
         assert!(gradient.abs_diff_eq(&gradient_ref, 1e-15));
         assert!(sigma.abs_diff_eq(&sigma_ref, 1e-15));
+    }
+
+    // ==========================================================================
+    //  D3-Zero damping tests — PM6-D3H4 parameter values (Korth 2010, MOPAC):
+    //  s6=0.88, s8=0.0, rs6=1.18, rs8=1e-10, alp=22.0, s9=0 (no ATM in D3H4).
+    // ==========================================================================
+
+    use crate::dftd3::damping3::ZeroDamping3Param;
+    use crate::dftd3::disp3::get_dispersion_zero;
+
+    fn pm6_d3h4_param(mol: &Molecule) -> ZeroDamping3Param {
+        let p = D3Param {
+            s6: 0.880,
+            s8: 0.0,
+            s9: 0.0,
+            rs6: 1.18,
+            rs8: 1.0e-10,
+            a1: 0.0,
+            a2: 0.0,
+            alp: 22.0,
+            bet: 0.0,
+        };
+        ZeroDamping3Param::from((p, &mol.num))
+    }
+
+    /// D3-Zero energy: sanity check on uracil with PM6-D3H4 parameters.
+    /// Just confirms the entry point produces a finite, attractive
+    /// dispersion energy.
+    #[test]
+    fn d3_zero_dispersion_energy_finite() {
+        let mut mol: Molecule = get_uracil();
+        let disp: D3Model = D3Model::from_molecule(&mol, None);
+        let param = pm6_d3h4_param(&mol);
+        let cutoff: RealspaceCutoff = RealspaceCutoffBuilder::new().build();
+        let res = get_dispersion_zero(&mut mol, &disp, &param, &cutoff, false, false, 1);
+        assert!(res.energy.is_finite(), "energy not finite: {}", res.energy);
+        assert!(res.energy < 0.0, "D3-Zero energy must be attractive, got {}", res.energy);
+        assert!(res.gradient.is_none());
+        assert!(res.sigma.is_none());
+    }
+
+    /// D3-Zero gradient is finite, translationally invariant, and matches
+    /// a 5-point FD on the same `get_dispersion_zero` energy entry point.
+    #[test]
+    fn d3_zero_dispersion_gradient_matches_5point_fd() {
+        let mut mol_ref: Molecule = get_uracil();
+        let disp: D3Model = D3Model::from_molecule(&mol_ref, None);
+        let param = pm6_d3h4_param(&mol_ref);
+        let cutoff: RealspaceCutoff = RealspaceCutoffBuilder::new().build();
+        let res = get_dispersion_zero(&mut mol_ref, &disp, &param, &cutoff, false, true, 1);
+        let grad = res.gradient.expect("gradient requested");
+        let n = mol_ref.n_atoms;
+        assert_eq!(grad.shape(), &[n, 3]);
+
+        // Translational invariance.
+        for d in 0..3 {
+            let s: f64 = grad.column(d).sum();
+            assert!(
+                s.abs() < 1.0e-10,
+                "translational invariance broken on axis {}: {:e}", d, s
+            );
+        }
+
+        // 5-point central FD vs analytic gradient. Step in Bohr (positions
+        // here are in Bohr by construction in `get_uracil`).
+        let h = 1.0e-3_f64;
+        let twelve_h = 12.0 * h;
+        let energy_at = |dx: f64, dy: f64, dz: f64, idx: usize| -> f64 {
+            let mut mol = get_uracil();
+            mol.atomlist.xyz[idx][0] += dx;
+            mol.atomlist.xyz[idx][1] += dy;
+            mol.atomlist.xyz[idx][2] += dz;
+            let disp = D3Model::from_molecule(&mol, None);
+            let param = pm6_d3h4_param(&mol);
+            let cutoff: RealspaceCutoff = RealspaceCutoffBuilder::new().build();
+            get_dispersion_zero(&mut mol, &disp, &param, &cutoff, false, false, 1).energy
+        };
+
+        let mut max_diff = 0.0_f64;
+        // Spot-check 3 atoms to keep the FD cost down (each takes 12 SCF-equivalents).
+        for &ia in &[0_usize, 5, 10] {
+            for alpha in 0..3 {
+                let mut step = |delta: f64| -> f64 {
+                    let (dx, dy, dz) = match alpha {
+                        0 => (delta, 0.0, 0.0),
+                        1 => (0.0, delta, 0.0),
+                        _ => (0.0, 0.0, delta),
+                    };
+                    energy_at(dx, dy, dz, ia)
+                };
+                let e_p2 = step(2.0 * h);
+                let e_p1 = step(h);
+                let e_m1 = step(-h);
+                let e_m2 = step(-2.0 * h);
+                let g_fd = (-e_p2 + 8.0 * e_p1 - 8.0 * e_m1 + e_m2) / twelve_h;
+                let g_an = grad[[ia, alpha]];
+                let d = (g_an - g_fd).abs();
+                if d > max_diff {
+                    max_diff = d;
+                }
+            }
+        }
+        assert!(
+            max_diff < 1.0e-9,
+            "D3-Zero gradient max |analytic − 5pt FD| = {:.3e} too large",
+            max_diff
+        );
     }
 }

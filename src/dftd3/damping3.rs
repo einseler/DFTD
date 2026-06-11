@@ -650,6 +650,486 @@ impl RationalDamping3Param {
     }
 }
 
+// =========================================================================
+//
+// Grimme D3 zero-damping (D3-Zero, original Grimme 2010 form).
+//
+// Two-body damping function:
+//     f_n(R)  =  1 / (1 + 6·(sr_n·R0_ij / R)^α_n)
+// with α_8 = α_6 + 2 by convention. Differs from BJ (RationalDamping3)
+// in the functional form of the radial damping: BJ uses
+// `1 / (R^n + (a1·√(3 r4r2_i r4r2_j) + a2)^n)`, zero uses the
+// `1 / (1 + 6·(R0/R)^α)` form which is "soft" rather than "rational".
+//
+// 2-body energy contribution per pair (no R^8 contribution if sr8 → ∞):
+//     E_ij = -(s6·C6_ij / R^6)·f6 - (s8·C8_ij / R^8)·f8
+// where C8_ij = 3·r4r2_i·r4r2_j·C6_ij (same convention as BJ).
+//
+// 3-body ATM term re-uses `get_atm3_dispersion(_grad)` — those already
+// implement zero-damping for the 3-body channel.
+//
+// Used by methods such as PM6-D3H4 (Korth 2010, Rezac/Hobza 2012)
+// where the original D3-Zero damping is preferred over BJ.
+//
+// =========================================================================
+
+pub struct ZeroDamping3Param {
+    pub s6: f64,
+    pub s8: f64,
+    pub s9: f64,
+    pub rs6: f64,
+    pub rs8: f64,
+    pub alp: f64,
+    pub r4r2: Array1<f64>,
+    pub rvdw: Array2<f64>,
+}
+
+impl From<(D3Param, &Vec<u8>)> for ZeroDamping3Param {
+    fn from((param, num): (D3Param, &Vec<u8>)) -> ZeroDamping3Param {
+        let mut r4r2: Array1<f64> = Array::zeros(num.len());
+        for (num_i, r4r2_i) in num.iter().zip(r4r2.iter_mut()) {
+            *r4r2_i = Element::from(*num_i).get_r4r2_val();
+        }
+
+        let mut rvdw: Array2<f64> = Array::zeros((num.len(), num.len()));
+        for (isp, izp) in num.iter().enumerate() {
+            for (jsp, jzp) in num[..=isp].iter().enumerate() {
+                rvdw[[isp, jsp]] = get_vdw_rad_pair(*jzp, *izp);
+                rvdw[[jsp, isp]] = rvdw[[isp, jsp]];
+            }
+        }
+
+        ZeroDamping3Param {
+            s6: param.s6,
+            s8: param.s8,
+            s9: param.s9,
+            rs6: param.rs6,
+            rs8: param.rs8,
+            alp: param.alp,
+            r4r2,
+            rvdw,
+        }
+    }
+}
+
+impl ZeroDamping3Param {
+    /// Serial 2-body D3-Zero energy. Pair-wise loop, same iteration
+    /// structure as `RationalDamping3Param::get_dispersion2`.
+    pub fn get_dispersion2(
+        &self,
+        mol: &Molecule,
+        trans: &Matrix3xX<f64>,
+        cutoff: f64,
+        c6: ArrayView2<f64>,
+        mut energy: ArrayViewMut1<f64>,
+    ) {
+        if self.s6.abs() < EPSILON && self.s8.abs() < EPSILON {
+            return;
+        }
+        let cutoff2 = cutoff * cutoff;
+        let alp6 = self.alp;
+        let alp8 = self.alp + 2.0;
+
+        for (iat, ((izp, xyz_i), c6_i)) in
+            soa_zip!(&mol.atomlist, [identifier, xyz]).zip(c6.outer_iter()).enumerate()
+        {
+            for (jat, ((jzp, xyz_j), c6ij)) in soa_zip!(
+                &mol.atomlist.slice(0..iat + 1),
+                [identifier, xyz]
+            )
+            .zip(c6_i.iter())
+            .enumerate()
+            {
+                let r0 = self.rvdw[[*izp, *jzp]];
+                let r0_sr6 = self.rs6 * r0;
+                let r0_sr8 = self.rs8 * r0;
+                let c8ij = 3.0 * self.r4r2[*izp] * self.r4r2[*jzp] * (*c6ij);
+
+                for trans_jtr in trans.column_iter() {
+                    let vec: Vector3<f64> = (xyz_i - xyz_j) - trans_jtr;
+                    let r2 = vec.norm_squared();
+                    if r2 > cutoff2 || r2 < EPSILON {
+                        continue;
+                    }
+                    let r = r2.sqrt();
+                    let r6 = r2 * r2 * r2;
+                    let r8 = r6 * r2;
+
+                    let u6 = r0_sr6 / r;
+                    let u8 = r0_sr8 / r;
+                    let f6 = 1.0 / (1.0 + 6.0 * u6.powf(alp6));
+                    let f8 = 1.0 / (1.0 + 6.0 * u8.powf(alp8));
+
+                    let e6 = -self.s6 * (*c6ij) / r6 * f6;
+                    let e8 = -self.s8 * c8ij / r8 * f8;
+                    let de = (e6 + e8) * 0.5;
+
+                    energy[iat] += de;
+                    if iat != jat {
+                        energy[jat] += de;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parallel 2-body D3-Zero energy.
+    pub fn get_dispersion2_par(
+        &self,
+        mol: &Molecule,
+        trans: &Matrix3xX<f64>,
+        cutoff: f64,
+        c6: ArrayView2<f64>,
+        mut energy: ArrayViewMut1<f64>,
+    ) {
+        if self.s6.abs() < EPSILON && self.s8.abs() < EPSILON {
+            return;
+        }
+        let cutoff2 = cutoff * cutoff;
+        let n = mol.n_atoms;
+        let alp6 = self.alp;
+        let alp8 = self.alp + 2.0;
+
+        let energy_par = (0..n)
+            .into_par_iter()
+            .fold(
+                || Array1::<f64>::zeros(n),
+                |mut e_local, iat| {
+                    let izp = mol.atomlist.identifier[iat];
+                    let xyz_i = &mol.atomlist.xyz[iat];
+                    for jat in 0..=iat {
+                        let jzp = mol.atomlist.identifier[jat];
+                        let xyz_j = &mol.atomlist.xyz[jat];
+                        let c6ij = c6[[iat, jat]];
+                        let r0 = self.rvdw[[izp, jzp]];
+                        let r0_sr6 = self.rs6 * r0;
+                        let r0_sr8 = self.rs8 * r0;
+                        let c8ij = 3.0 * self.r4r2[izp] * self.r4r2[jzp] * c6ij;
+
+                        for trans_jtr in trans.column_iter() {
+                            let vec: Vector3<f64> = (xyz_i - xyz_j) - trans_jtr;
+                            let r2 = vec.norm_squared();
+                            if r2 > cutoff2 || r2 < EPSILON {
+                                continue;
+                            }
+                            let r = r2.sqrt();
+                            let r6 = r2 * r2 * r2;
+                            let r8 = r6 * r2;
+
+                            let u6 = r0_sr6 / r;
+                            let u8 = r0_sr8 / r;
+                            let f6 = 1.0 / (1.0 + 6.0 * u6.powf(alp6));
+                            let f8 = 1.0 / (1.0 + 6.0 * u8.powf(alp8));
+
+                            let e6 = -self.s6 * c6ij / r6 * f6;
+                            let e8 = -self.s8 * c8ij / r8 * f8;
+                            let de = (e6 + e8) * 0.5;
+
+                            e_local[iat] += de;
+                            if iat != jat {
+                                e_local[jat] += de;
+                            }
+                        }
+                    }
+                    e_local
+                },
+            )
+            .reduce(|| Array1::<f64>::zeros(n), |a, b| a + b);
+        energy += &energy_par;
+    }
+
+    /// Serial 2-body D3-Zero gradient + energy + dedcn + sigma.
+    ///
+    /// For damping `f(r) = 1 / (1 + 6·u^α)` with `u = sr·R0/r`,
+    /// `df/dr = 6·α·u^α·f² / r`. Combined with the bare 1/r^n decay:
+    ///
+    /// ```text
+    /// ∂(−s_n·C_n·f / r^n) / ∂r
+    ///     = s_n·C_n · [ n·f / r^(n+1) − f'(r) / r^n ]
+    ///     = s_n·C_n / r^(n+1) · f · [ n − 6·α·u^α · f ]
+    /// ```
+    ///
+    /// Vector contribution: ∂E/∂R_j = (∂E/∂r) · (R_j − R_i) / r.
+    pub fn get_dispersion2_grad(
+        &self,
+        mol: &Molecule,
+        trans: &Matrix3xX<f64>,
+        cutoff: f64,
+        c6: ArrayView2<f64>,
+        dc6dcn: ArrayView2<f64>,
+        mut energy: ArrayViewMut1<f64>,
+        mut dedcn: ArrayViewMut1<f64>,
+        mut gradient: ArrayViewMut2<f64>,
+        mut sigma: ArrayViewMut2<f64>,
+    ) {
+        if self.s6.abs() < EPSILON && self.s8.abs() < EPSILON {
+            return;
+        }
+        let cutoff2 = cutoff * cutoff;
+        let alp6 = self.alp;
+        let alp8 = self.alp + 2.0;
+
+        for (iat, ((izp, xyz_i), c6_i)) in
+            soa_zip!(&mol.atomlist, [identifier, xyz]).zip(c6.outer_iter()).enumerate()
+        {
+            for (jat, ((jzp, xyz_j), c6ij)) in soa_zip!(
+                &mol.atomlist.slice(0..iat + 1),
+                [identifier, xyz]
+            )
+            .zip(c6_i.iter())
+            .enumerate()
+            {
+                let r0 = self.rvdw[[*izp, *jzp]];
+                let r0_sr6 = self.rs6 * r0;
+                let r0_sr8 = self.rs8 * r0;
+                let rrij = 3.0 * self.r4r2[*izp] * self.r4r2[*jzp];
+                let dc6dcn_ji = dc6dcn[[jat, iat]];
+                let dc6dcn_ij = dc6dcn[[iat, jat]];
+
+                for trans_jtr in trans.column_iter() {
+                    let vec_v: Vector3<f64> = (xyz_i - xyz_j) - trans_jtr;
+                    let r2 = vec_v.norm_squared();
+                    if r2 > cutoff2 || r2 < EPSILON {
+                        continue;
+                    }
+                    let vec_arr = [vec_v[0], vec_v[1], vec_v[2]];
+                    let r = r2.sqrt();
+                    let r6 = r2 * r2 * r2;
+                    let r8 = r6 * r2;
+
+                    let u6 = r0_sr6 / r;
+                    let u8 = r0_sr8 / r;
+                    let u6a = u6.powf(alp6);
+                    let u8a = u8.powf(alp8);
+                    let f6 = 1.0 / (1.0 + 6.0 * u6a);
+                    let f8 = 1.0 / (1.0 + 6.0 * u8a);
+
+                    // Pairwise (un-symmetrised) dispersion energy, then halved
+                    // at the outer write so iat==jat self-pair contributes
+                    // once (consistent with the BJ implementation above).
+                    let e6_per_c6 = -self.s6 * f6 / r6;
+                    let e8_per_c6 = -self.s8 * rrij * f8 / r8;
+                    let edisp_per_c6 = e6_per_c6 + e8_per_c6;
+                    let de = (*c6ij) * edisp_per_c6 * 0.5;
+
+                    // Radial derivative ∂E_per_C6 / ∂r ; chain rule for f.
+                    // d(-s·f/r^n)/dr = -s·f'/r^n + s·n·f/r^(n+1)
+                    //                = (s/r^(n+1)) · [n·f − r·f']
+                    //                = (s/r^(n+1)) · f · [n − 6·α·u^α·f]
+                    // We carry only the SCALAR (1/r) · ∂E/∂r so the vector
+                    // gradient is `gscale · (R_j − R_i)`, where
+                    //   gscale = (1/r) · ∂E/∂r  (so multiplying by vec_v gives a force).
+                    // The implementation factors so that gscale already
+                    // has the C6 baked in:
+                    let de6_per_c6_dr = self.s6 * f6 * (6.0 - 6.0 * alp6 * u6a * f6) / (r6 * r);
+                    let de8_per_c6_dr =
+                        self.s8 * rrij * f8 * (8.0 - 6.0 * alp8 * u8a * f8) / (r8 * r);
+                    let gdisp_per_c6 = de6_per_c6_dr + de8_per_c6_dr;
+                    let dg_scale = (*c6ij) * gdisp_per_c6 / r;
+                    let dg = [
+                        dg_scale * vec_arr[0],
+                        dg_scale * vec_arr[1],
+                        dg_scale * vec_arr[2],
+                    ];
+
+                    energy[iat] += de;
+                    dedcn[iat] += dc6dcn_ji * edisp_per_c6;
+                    for a in 0..3 {
+                        for b in 0..3 {
+                            sigma[[a, b]] += dg[a] * vec_arr[b] * 0.5;
+                        }
+                    }
+                    if iat != jat {
+                        energy[jat] += de;
+                        dedcn[jat] += dc6dcn_ij * edisp_per_c6;
+                        for d in 0..3 {
+                            gradient[[iat, d]] += dg[d];
+                            gradient[[jat, d]] -= dg[d];
+                        }
+                        for a in 0..3 {
+                            for b in 0..3 {
+                                sigma[[a, b]] += dg[a] * vec_arr[b] * 0.5;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parallel 2-body D3-Zero gradient.
+    pub fn get_dispersion2_grad_par(
+        &self,
+        mol: &Molecule,
+        trans: &Matrix3xX<f64>,
+        cutoff: f64,
+        c6: ArrayView2<f64>,
+        dc6dcn: ArrayView2<f64>,
+        mut energy: ArrayViewMut1<f64>,
+        mut dedcn: ArrayViewMut1<f64>,
+        mut gradient: ArrayViewMut2<f64>,
+        mut sigma: ArrayViewMut2<f64>,
+    ) {
+        if self.s6.abs() < EPSILON && self.s8.abs() < EPSILON {
+            return;
+        }
+        let cutoff2 = cutoff * cutoff;
+        let n = mol.n_atoms;
+        let alp6 = self.alp;
+        let alp8 = self.alp + 2.0;
+
+        let (e_par, dedcn_par, grad_par, sigma_par) = (0..n)
+            .into_par_iter()
+            .fold(
+                || (
+                    Array1::<f64>::zeros(n),
+                    Array1::<f64>::zeros(n),
+                    Array2::<f64>::zeros((n, 3)),
+                    Array2::<f64>::zeros((3, 3)),
+                ),
+                |(mut e_local, mut dedcn_local, mut g_local, mut s_local), iat| {
+                    let izp = mol.atomlist.identifier[iat];
+                    let xyz_i = &mol.atomlist.xyz[iat];
+                    for jat in 0..=iat {
+                        let jzp = mol.atomlist.identifier[jat];
+                        let xyz_j = &mol.atomlist.xyz[jat];
+                        let c6ij = c6[[iat, jat]];
+                        let r0 = self.rvdw[[izp, jzp]];
+                        let r0_sr6 = self.rs6 * r0;
+                        let r0_sr8 = self.rs8 * r0;
+                        let rrij = 3.0 * self.r4r2[izp] * self.r4r2[jzp];
+                        let dc6dcn_ji = dc6dcn[[jat, iat]];
+                        let dc6dcn_ij = dc6dcn[[iat, jat]];
+
+                        for trans_jtr in trans.column_iter() {
+                            let vec_v: Vector3<f64> = (xyz_i - xyz_j) - trans_jtr;
+                            let r2 = vec_v.norm_squared();
+                            if r2 > cutoff2 || r2 < EPSILON {
+                                continue;
+                            }
+                            let vec_arr = [vec_v[0], vec_v[1], vec_v[2]];
+                            let r = r2.sqrt();
+                            let r6 = r2 * r2 * r2;
+                            let r8 = r6 * r2;
+
+                            let u6 = r0_sr6 / r;
+                            let u8 = r0_sr8 / r;
+                            let u6a = u6.powf(alp6);
+                            let u8a = u8.powf(alp8);
+                            let f6 = 1.0 / (1.0 + 6.0 * u6a);
+                            let f8 = 1.0 / (1.0 + 6.0 * u8a);
+
+                            let e6_per_c6 = -self.s6 * f6 / r6;
+                            let e8_per_c6 = -self.s8 * rrij * f8 / r8;
+                            let edisp_per_c6 = e6_per_c6 + e8_per_c6;
+                            let de = c6ij * edisp_per_c6 * 0.5;
+
+                            let de6_per_c6_dr =
+                                self.s6 * f6 * (6.0 - 6.0 * alp6 * u6a * f6) / (r6 * r);
+                            let de8_per_c6_dr =
+                                self.s8 * rrij * f8 * (8.0 - 6.0 * alp8 * u8a * f8) / (r8 * r);
+                            let gdisp_per_c6 = de6_per_c6_dr + de8_per_c6_dr;
+                            let dg_scale = c6ij * gdisp_per_c6 / r;
+                            let dg = [
+                                dg_scale * vec_arr[0],
+                                dg_scale * vec_arr[1],
+                                dg_scale * vec_arr[2],
+                            ];
+
+                            e_local[iat] += de;
+                            dedcn_local[iat] += dc6dcn_ji * edisp_per_c6;
+                            for a in 0..3 {
+                                for b in 0..3 {
+                                    s_local[[a, b]] += dg[a] * vec_arr[b] * 0.5;
+                                }
+                            }
+                            if iat != jat {
+                                e_local[jat] += de;
+                                dedcn_local[jat] += dc6dcn_ij * edisp_per_c6;
+                                for d in 0..3 {
+                                    g_local[[iat, d]] += dg[d];
+                                    g_local[[jat, d]] -= dg[d];
+                                }
+                                for a in 0..3 {
+                                    for b in 0..3 {
+                                        s_local[[a, b]] += dg[a] * vec_arr[b] * 0.5;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (e_local, dedcn_local, g_local, s_local)
+                },
+            )
+            .reduce(
+                || (
+                    Array1::<f64>::zeros(n),
+                    Array1::<f64>::zeros(n),
+                    Array2::<f64>::zeros((n, 3)),
+                    Array2::<f64>::zeros((3, 3)),
+                ),
+                |(e1, d1, g1, s1), (e2, d2, g2, s2)| (e1 + e2, d1 + d2, g1 + g2, s1 + s2),
+            );
+
+        energy += &e_par;
+        dedcn += &dedcn_par;
+        gradient += &grad_par;
+        sigma += &sigma_par;
+    }
+
+    /// 3-body ATM dispersion (zero damping by construction — re-use the
+    /// shared `get_atm3_dispersion`).
+    pub fn get_dispersion3(
+        &self,
+        mol: &Molecule,
+        trans: &Matrix3xX<f64>,
+        cutoff: f64,
+        c6: ArrayView2<f64>,
+        energy: ArrayViewMut1<f64>,
+    ) {
+        get_atm3_dispersion(
+            mol,
+            trans,
+            cutoff,
+            self.s9,
+            4.0 / 3.0,
+            self.alp + 2.0,
+            self.rvdw.view(),
+            c6,
+            energy,
+        )
+    }
+
+    pub fn get_dispersion3_grad(
+        &self,
+        mol: &Molecule,
+        trans: &Matrix3xX<f64>,
+        cutoff: f64,
+        c6: ArrayView2<f64>,
+        dc6dcn: ArrayView2<f64>,
+        energy: ArrayViewMut1<f64>,
+        dedcn: ArrayViewMut1<f64>,
+        gradient: ArrayViewMut2<f64>,
+        sigma: ArrayViewMut2<f64>,
+    ) {
+        get_atm3_dispersion_grad(
+            mol,
+            trans,
+            cutoff,
+            self.s9,
+            4.0 / 3.0,
+            self.alp + 2.0,
+            self.rvdw.view(),
+            c6,
+            dc6dcn,
+            energy,
+            dedcn,
+            gradient,
+            sigma,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::model::Molecule;
